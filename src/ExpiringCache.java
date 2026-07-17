@@ -83,6 +83,9 @@ public class ExpiringCache<K, V> {
             Node<K, V> prev = node.prev;
             if (isExpired(node)) {
                 removeNode(node);
+                if (map.size() < capacity) {
+                    return;
+                }
                 node = prev;
                 continue;
             }
@@ -98,7 +101,15 @@ public class ExpiringCache<K, V> {
     public int size() {
         lock.lock();
         try {
-            return map.size(); // expiry-aware size in Task 3
+            Node<K, V> node = head;
+            while (node != null) {
+                Node<K, V> next = node.next;
+                if (isExpired(node)) {
+                    removeNode(node);
+                }
+                node = next;
+            }
+            return map.size();
         } finally {
             lock.unlock();
         }

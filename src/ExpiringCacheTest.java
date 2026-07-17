@@ -14,6 +14,9 @@ public class ExpiringCacheTest {
         testLruEviction();
         testGetUpdatesLruOrder();
         testUpdateExistingKey();
+        testExpiration();
+        testSizeIgnoresExpired();
+        testExpiredSkippedDuringEviction();
 
         System.out.println();
         System.out.println("Passed: " + passed + "  Failed: " + failed);
@@ -83,6 +86,37 @@ public class ExpiringCacheTest {
         cache.get("a");
         cache.put("c", "charlie", 5_000);
         assertNull(cache.get("b"));
+    }
+
+    static void testExpiration() {
+        AtomicLong now = new AtomicLong(1_000_000L);
+        ExpiringCache<String, String> cache = new ExpiringCache<>(2, now::get);
+        cache.put("a", "alpha", 100); // expires at 1_000_100
+        assertEq("alpha", cache.get("a"));
+        now.set(1_000_100L);
+        assertNull(cache.get("a"));
+    }
+
+    static void testSizeIgnoresExpired() {
+        AtomicLong now = new AtomicLong(1_000_000L);
+        ExpiringCache<String, String> cache = new ExpiringCache<>(2, now::get);
+        cache.put("a", "alpha", 50);
+        cache.put("b", "bravo", 5_000);
+        now.set(1_000_050L);
+        assertEq(1, cache.size());
+        assertEq("bravo", cache.get("b"));
+    }
+
+    static void testExpiredSkippedDuringEviction() {
+        AtomicLong now = new AtomicLong(1_000_000L);
+        ExpiringCache<String, String> cache = new ExpiringCache<>(2, now::get);
+        cache.put("a", "alpha", 50);   // will expire
+        cache.put("b", "bravo", 5_000);
+        now.set(1_000_050L);
+        cache.put("c", "charlie", 5_000); // should drop expired a, keep b, add c
+        assertNull(cache.get("a"));
+        assertEq("bravo", cache.get("b"));
+        assertEq("charlie", cache.get("c"));
     }
 
     static void assertEq(Object expected, Object actual) {
