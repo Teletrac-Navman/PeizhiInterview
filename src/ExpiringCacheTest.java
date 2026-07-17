@@ -22,6 +22,8 @@ public class ExpiringCacheTest {
         testLoaderFailureAndRetry();
         testSameKeyReentryThrows();
         testLoaderNullResultRejected();
+        testConcurrentGetPut();
+        testConcurrentLoadDifferentKeys();
 
         System.out.println();
         System.out.println("Passed: " + passed + "  Failed: " + failed);
@@ -198,6 +200,89 @@ public class ExpiringCacheTest {
         expectThrows(IllegalArgumentException.class, () ->
                 cache.computeIfAbsent("k", 5_000, key -> null));
         assertNull(cache.get("k"));
+    }
+
+    static void testConcurrentGetPut() throws Exception {
+        ExpiringCache<Integer, Integer> cache = new ExpiringCache<>(100);
+        int threads = 8;
+        int ops = 500;
+        Thread[] ts = new Thread[threads];
+        for (int t = 0; t < threads; t++) {
+            final int id = t;
+            ts[t] = new Thread(() -> {
+                for (int i = 0; i < ops; i++) {
+                    int k = (id * ops + i) % 150;
+                    cache.put(k, k, 60_000);
+                    cache.get(k);
+                }
+            });
+            ts[t].start();
+        }
+        for (Thread t : ts) {
+            t.join();
+        }
+        assertTrue(cache.size() <= 100, "size must respect capacity");
+    }
+
+    static void testConcurrentLoadDifferentKeys() throws Exception {
+        ExpiringCache<String, String> cache = new ExpiringCache<>(10);
+        java.util.concurrent.CountDownLatch ready = new java.util.concurrent.CountDownLatch(2);
+        java.util.concurrent.CountDownLatch go = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.atomic.AtomicInteger concurrent = new java.util.concurrent.atomic.AtomicInteger();
+        java.util.concurrent.atomic.AtomicInteger maxConcurrent = new java.util.concurrent.atomic.AtomicInteger();
+
+        Runnable loadA = () -> cache.computeIfAbsent("a", 5_000, k -> {
+            ready.countDown();
+            try {
+                go.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException(e);
+            }
+            int c = concurrent.incrementAndGet();
+            maxConcurrent.accumulateAndGet(c, Math::max);
+            try {
+                Thread.sleep(50);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException(e);
+            } finally {
+                concurrent.decrementAndGet();
+            }
+            return "A";
+        });
+        Runnable loadB = () -> cache.computeIfAbsent("b", 5_000, k -> {
+            ready.countDown();
+            try {
+                go.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException(e);
+            }
+            int c = concurrent.incrementAndGet();
+            maxConcurrent.accumulateAndGet(c, Math::max);
+            try {
+                Thread.sleep(50);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException(e);
+            } finally {
+                concurrent.decrementAndGet();
+            }
+            return "B";
+        });
+
+        Thread t1 = new Thread(loadA);
+        Thread t2 = new Thread(loadB);
+        t1.start();
+        t2.start();
+        ready.await();
+        go.countDown();
+        t1.join();
+        t2.join();
+        assertTrue(maxConcurrent.get() >= 2, "different keys should load concurrently");
+        assertEq("A", cache.get("a"));
+        assertEq("B", cache.get("b"));
     }
 
     static void assertEq(Object expected, Object actual) {
