@@ -1,5 +1,9 @@
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Function;
 import java.util.function.LongSupplier;
@@ -14,6 +18,8 @@ public class ExpiringCache<K, V> {
     private final LongSupplier clock;
     private final ReentrantLock lock = new ReentrantLock();
     private final Map<K, Node<K, V>> map = new HashMap<>();
+    private final Map<K, CompletableFuture<V>> inFlight = new HashMap<>();
+    private final ThreadLocal<Set<K>> loadingKeys = ThreadLocal.withInitial(HashSet::new);
     private Node<K, V> head; // MRU
     private Node<K, V> tail; // LRU
 
@@ -55,25 +61,30 @@ public class ExpiringCache<K, V> {
         requireKey(key);
         requireValue(value);
         requireTtl(ttlMillis);
-        long expireAt = clock.getAsLong() + ttlMillis;
         lock.lock();
         try {
-            Node<K, V> existing = map.get(key);
-            if (existing != null) {
-                existing.value = value;
-                existing.expireAtMillis = expireAt;
-                moveToHead(existing);
-                return;
-            }
-            while (map.size() >= capacity) {
-                evictOne();
-            }
-            Node<K, V> node = new Node<>(key, value, expireAt);
-            map.put(key, node);
-            addToHead(node);
+            putUnderLock(key, value, ttlMillis);
         } finally {
             lock.unlock();
         }
+    }
+
+    /** Caller must hold lock. */
+    private void putUnderLock(K key, V value, long ttlMillis) {
+        long expireAt = clock.getAsLong() + ttlMillis;
+        Node<K, V> existing = map.get(key);
+        if (existing != null) {
+            existing.value = value;
+            existing.expireAtMillis = expireAt;
+            moveToHead(existing);
+            return;
+        }
+        while (map.size() >= capacity) {
+            evictOne();
+        }
+        Node<K, V> node = new Node<>(key, value, expireAt);
+        map.put(key, node);
+        addToHead(node);
     }
 
     /** Evict from LRU end: drop expired nodes; evict first live LRU. May be O(k). */
@@ -95,7 +106,85 @@ public class ExpiringCache<K, V> {
     }
 
     public V computeIfAbsent(K key, long ttlMillis, Function<K, V> loader) {
-        throw new UnsupportedOperationException("not implemented yet");
+        requireKey(key);
+        requireTtl(ttlMillis);
+        if (loader == null) {
+            throw new IllegalArgumentException("loader must be non-null");
+        }
+
+        CompletableFuture<V> assigned = null;
+
+        lock.lock();
+        try {
+            Node<K, V> existing = map.get(key);
+            if (existing != null) {
+                if (!isExpired(existing)) {
+                    moveToHead(existing);
+                    return existing.value;
+                }
+                removeNode(existing);
+            }
+
+            if (loadingKeys.get().contains(key)) {
+                throw new IllegalStateException("re-entrant computeIfAbsent for key: " + key);
+            }
+
+            CompletableFuture<V> pending = inFlight.get(key);
+            if (pending != null) {
+                lock.unlock();
+                try {
+                    return unwrapJoin(pending);
+                } finally {
+                    lock.lock();
+                }
+            }
+
+            assigned = new CompletableFuture<>();
+            inFlight.put(key, assigned);
+            loadingKeys.get().add(key);
+        } finally {
+            lock.unlock();
+        }
+
+        // Loader path (lock released)
+        try {
+            V value = loader.apply(key);
+            if (value == null) {
+                throw new IllegalArgumentException("loader must not return null");
+            }
+            lock.lock();
+            try {
+                putUnderLock(key, value, ttlMillis);
+                assigned.complete(value);
+                return value;
+            } finally {
+                inFlight.remove(key, assigned);
+                loadingKeys.get().remove(key);
+                lock.unlock();
+            }
+        } catch (RuntimeException e) {
+            lock.lock();
+            try {
+                assigned.completeExceptionally(e);
+                inFlight.remove(key, assigned);
+                loadingKeys.get().remove(key);
+            } finally {
+                lock.unlock();
+            }
+            throw e;
+        }
+    }
+
+    private V unwrapJoin(CompletableFuture<V> pending) {
+        try {
+            return pending.join();
+        } catch (CompletionException e) {
+            Throwable cause = e.getCause() == null ? e : e.getCause();
+            if (cause instanceof RuntimeException) {
+                throw (RuntimeException) cause;
+            }
+            throw new IllegalStateException(cause);
+        }
     }
 
     public int size() {

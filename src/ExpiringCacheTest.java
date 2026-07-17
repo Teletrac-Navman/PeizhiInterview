@@ -6,7 +6,7 @@ public class ExpiringCacheTest {
     private static int passed = 0;
     private static int failed = 0;
 
-    public static void main(String[] args) {
+    public static void main(String[] args) throws Exception {
         testRejectsNonPositiveCapacity();
         testRejectsNullKeyAndValueAndBadTtl();
         testPutGetAndSize();
@@ -17,6 +17,11 @@ public class ExpiringCacheTest {
         testExpiration();
         testSizeIgnoresExpired();
         testExpiredSkippedDuringEviction();
+        testComputeIfAbsentHitAndLoad();
+        testDuplicateLoadSuppression();
+        testLoaderFailureAndRetry();
+        testSameKeyReentryThrows();
+        testLoaderNullResultRejected();
 
         System.out.println();
         System.out.println("Passed: " + passed + "  Failed: " + failed);
@@ -117,6 +122,82 @@ public class ExpiringCacheTest {
         assertNull(cache.get("a"));
         assertEq("bravo", cache.get("b"));
         assertEq("charlie", cache.get("c"));
+    }
+
+    static void testComputeIfAbsentHitAndLoad() {
+        AtomicLong now = new AtomicLong(1_000_000L);
+        ExpiringCache<String, String> cache = new ExpiringCache<>(2, now::get);
+        String v = cache.computeIfAbsent("a", 5_000, k -> "loaded-" + k);
+        assertEq("loaded-a", v);
+        assertEq("loaded-a", cache.get("a"));
+        String again = cache.computeIfAbsent("a", 5_000, k -> {
+            fail("loader should not run on hit");
+            return "nope";
+        });
+        assertEq("loaded-a", again);
+    }
+
+    static void testDuplicateLoadSuppression() throws Exception {
+        AtomicLong now = new AtomicLong(1_000_000L);
+        ExpiringCache<String, String> cache = new ExpiringCache<>(2, now::get);
+        java.util.concurrent.CountDownLatch started = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.atomic.AtomicInteger loads = new java.util.concurrent.atomic.AtomicInteger();
+
+        Thread t1 = new Thread(() -> cache.computeIfAbsent("k", 5_000, key -> {
+            loads.incrementAndGet();
+            started.countDown();
+            try {
+                release.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException(e);
+            }
+            return "v";
+        }));
+        t1.start();
+        started.await();
+        Thread t2 = new Thread(() -> cache.computeIfAbsent("k", 5_000, key -> {
+            loads.incrementAndGet();
+            return "other";
+        }));
+        t2.start();
+        Thread.sleep(50); // give t2 time to attach as waiter
+        release.countDown();
+        t1.join();
+        t2.join();
+        assertEq(1, loads.get());
+        assertEq("v", cache.get("k"));
+    }
+
+    static void testLoaderFailureAndRetry() {
+        AtomicLong now = new AtomicLong(1_000_000L);
+        ExpiringCache<String, String> cache = new ExpiringCache<>(2, now::get);
+        java.util.concurrent.atomic.AtomicInteger loads = new java.util.concurrent.atomic.AtomicInteger();
+        expectThrows(RuntimeException.class, () -> cache.computeIfAbsent("k", 5_000, key -> {
+            loads.incrementAndGet();
+            throw new RuntimeException("boom");
+        }));
+        assertNull(cache.get("k"));
+        String v = cache.computeIfAbsent("k", 5_000, key -> {
+            loads.incrementAndGet();
+            return "ok";
+        });
+        assertEq("ok", v);
+        assertEq(2, loads.get());
+    }
+
+    static void testSameKeyReentryThrows() {
+        ExpiringCache<String, String> cache = new ExpiringCache<>(2);
+        expectThrows(IllegalStateException.class, () -> cache.computeIfAbsent("k", 5_000, key ->
+                cache.computeIfAbsent("k", 5_000, k2 -> "nested")));
+    }
+
+    static void testLoaderNullResultRejected() {
+        ExpiringCache<String, String> cache = new ExpiringCache<>(2);
+        expectThrows(IllegalArgumentException.class, () ->
+                cache.computeIfAbsent("k", 5_000, key -> null));
+        assertNull(cache.get("k"));
     }
 
     static void assertEq(Object expected, Object actual) {
