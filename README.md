@@ -101,3 +101,36 @@ Provide:
   - duplicate-load suppression;
   - loader failure and retry;
   - concurrent loading of different keys.
+
+## Documented edge-case policy
+
+- Null keys, null values, null loaders, and null loader results throw `IllegalArgumentException`.
+- Non-positive capacity or TTL throws `IllegalArgumentException`.
+- Loader re-entry on the same key throws `IllegalStateException`; re-entry on other keys is allowed.
+- Expired entries are never returned; removal is lazy. `size()` ignores expired entries.
+- `get`/`put` aim for average O(1). `size()` may be O(n). Eviction may be O(k) over trailing expired LRU nodes.
+
+## Solution layout
+
+- `src/ExpiringCache.java` — implementation
+- `src/ExpiringCacheTest.java` — dependency-free tests (`main`)
+
+## Build and run tests
+
+Requires JDK 8+ on `PATH`.
+
+```powershell
+New-Item -ItemType Directory -Force -Path out | Out-Null
+javac -d out src\ExpiringCache.java src\ExpiringCacheTest.java
+java -cp out ExpiringCacheTest
+```
+
+Expected output ends with `Failed: 0`.
+
+## Implementation notes
+
+- `HashMap<K, Node>` provides O(1) key lookup.
+- Intrusive doubly linked list maintains LRU order: MRU at head, LRU at tail.
+- Single `ReentrantLock` guards all shared state (map, list, in-flight registry).
+- `computeIfAbsent` releases the lock during loader execution; in-flight `CompletableFuture` enables single-flight semantics without blocking other keys.
+- Injectable `LongSupplier` clock allows deterministic expiry testing without wall-clock sleeps.
