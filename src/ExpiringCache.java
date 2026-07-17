@@ -65,12 +65,29 @@ public class ExpiringCache<K, V> {
                 moveToHead(existing);
                 return;
             }
-            // Capacity / eviction added in Task 2
+            while (map.size() >= capacity) {
+                evictOne();
+            }
             Node<K, V> node = new Node<>(key, value, expireAt);
             map.put(key, node);
             addToHead(node);
         } finally {
             lock.unlock();
+        }
+    }
+
+    /** Evict from LRU end: drop expired nodes; evict first live LRU. May be O(k). */
+    private void evictOne() {
+        Node<K, V> node = tail;
+        while (node != null) {
+            Node<K, V> prev = node.prev;
+            if (isExpired(node)) {
+                removeNode(node);
+                node = prev;
+                continue;
+            }
+            removeNode(node);
+            return;
         }
     }
 

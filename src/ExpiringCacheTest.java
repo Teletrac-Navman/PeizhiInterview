@@ -11,6 +11,9 @@ public class ExpiringCacheTest {
         testRejectsNullKeyAndValueAndBadTtl();
         testPutGetAndSize();
         testGetMissReturnsNull();
+        testLruEviction();
+        testGetUpdatesLruOrder();
+        testUpdateExistingKey();
 
         System.out.println();
         System.out.println("Passed: " + passed + "  Failed: " + failed);
@@ -44,6 +47,42 @@ public class ExpiringCacheTest {
     static void testGetMissReturnsNull() {
         ExpiringCache<String, String> cache = new ExpiringCache<>(2);
         assertNull(cache.get("missing"));
+    }
+
+    static void testUpdateExistingKey() {
+        AtomicLong now = new AtomicLong(1_000_000L);
+        ExpiringCache<String, String> cache = new ExpiringCache<>(2, now::get);
+        cache.put("a", "alpha", 5_000);
+        cache.put("b", "bravo", 5_000);
+        cache.put("a", "ALPHA", 5_000); // update + becomes MRU
+        cache.put("c", "charlie", 5_000); // evicts b (LRU)
+        assertEq("ALPHA", cache.get("a"));
+        assertNull(cache.get("b"));
+        assertEq("charlie", cache.get("c"));
+        assertEq(2, cache.size());
+    }
+
+    static void testLruEviction() {
+        AtomicLong now = new AtomicLong(1_000_000L);
+        ExpiringCache<String, String> cache = new ExpiringCache<>(2, now::get);
+        cache.put("a", "alpha", 5_000);
+        cache.put("b", "bravo", 5_000);
+        cache.get("a"); // a becomes MRU; b is LRU
+        cache.put("c", "charlie", 5_000); // evict b
+        assertNull(cache.get("b"));
+        assertEq("alpha", cache.get("a"));
+        assertEq("charlie", cache.get("c"));
+        assertEq(2, cache.size());
+    }
+
+    static void testGetUpdatesLruOrder() {
+        AtomicLong now = new AtomicLong(1_000_000L);
+        ExpiringCache<String, String> cache = new ExpiringCache<>(2, now::get);
+        cache.put("a", "alpha", 5_000);
+        cache.put("b", "bravo", 5_000);
+        cache.get("a");
+        cache.put("c", "charlie", 5_000);
+        assertNull(cache.get("b"));
     }
 
     static void assertEq(Object expected, Object actual) {
